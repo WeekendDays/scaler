@@ -28,7 +28,7 @@ public class SimpleScaler implements Scaler {
     private final Deque<Instance> idleInstances;
     //允许同时创建的最大实例数
     private final int MAX_INSTANCE_COUNT = 50;
-    private RequestCounter requestCounter;
+    private final RequestCounter requestCounter;
     // 修改扩容触发百分比（根据需要调整此数值）
     private static final double SCALING_TRIGGER_PERCENTAGE = 1.2; // 前一秒请求总数的80%
 
@@ -39,6 +39,7 @@ public class SimpleScaler implements Scaler {
             this.platformClient = new PlatformClient(config.getPlatformHost(), config.getPlatformPort());
             this.mu = new ReentrantLock();
             this.wg = new CountDownLatch(1);
+            this.requestCounter = new RequestCounter();
             this.instances = new ConcurrentHashMap<>();
             this.idleInstances = new LinkedList<>();
             logger.info(String.format("New scaler for app: %s is created", function.getKey()));
@@ -50,7 +51,7 @@ public class SimpleScaler implements Scaler {
 
     public void Assign(Context ctx, SchedulerProto.AssignRequest request, StreamObserver<SchedulerProto.AssignReply> responseObserver) throws Exception {
         Instant start = Instant.now();
-        String instanceId = UUID.randomUUID().toString();
+        String instanceID = null;
         try {
             logger.info("Start assign, request id: " + request.getRequestId());
             //获取前一秒内的请求数
@@ -59,8 +60,22 @@ public class SimpleScaler implements Scaler {
             int targetPerInstance = 20;
             //需要的实例数量
             int desiredInstanceCount = metricInSystem /targetPerInstance;
+
+            SchedulerProto.Meta meta = SchedulerProto.Meta.newBuilder()
+                    .setKey(request.getMetaData().getKey())
+                    .setRuntime(request.getMetaData().getRuntime())
+                    .setTimeoutInSecs(request.getMetaData().getTimeoutInSecs())
+                    .build();
+            Function function = new Function(meta);
+            
             if (idleInstances.isEmpty() || idleInstances.size() < desiredInstanceCount * SCALING_TRIGGER_PERCENTAGE) {
-                int newInstances = (int) Math.min(desiredInstanceCount * SCALING_TRIGGER_PERCENTAGE - idleInstances.size(), MAX_INSTANCE_COUNT - idleInstances.size());
+                int newInstances;
+                if (idleInstances.isEmpty()) {
+                    newInstances = 20;
+                } else {
+                    newInstances = (int) Math.min(desiredInstanceCount * SCALING_TRIGGER_PERCENTAGE - idleInstances.size(), MAX_INSTANCE_COUNT - idleInstances.size());
+                }
+                
                 for (int i = 0; i < newInstances; i++) {
                     // Create new instance
                     SchedulerProto.ResourceConfig resourceConfig = SchedulerProto.ResourceConfig.newBuilder()
@@ -69,15 +84,7 @@ public class SimpleScaler implements Scaler {
 
                     ListenableFuture<Slot> slotFuture = platformClient.CreateSlot(ctx, request.getRequestId(), slotResourceConfig);
                     Slot slot = slotFuture.get();
-
-                    SchedulerProto.Meta meta = SchedulerProto.Meta.newBuilder()
-                            .setKey(request.getMetaData().getKey())
-                            .setRuntime(request.getMetaData().getRuntime())
-                            .setTimeoutInSecs(request.getMetaData().getTimeoutInSecs())
-                            .build();
-                    Function function = new Function(meta);
-
-                    ListenableFuture<Instance> instanceFuture = platformClient.Init(ctx, request.getRequestId(), instanceId, slot, function);
+                    ListenableFuture<Instance> instanceFuture = platformClient.Init(ctx, request.getRequestId(), UUID.randomUUID().toString(), slot, function);
                     Instance instance = instanceFuture.get();
                     mu.lock();
                     instance.setBusy(false);
@@ -90,11 +97,11 @@ public class SimpleScaler implements Scaler {
                 mu.lock();
                 Instance instance = idleInstances.pollFirst();
                 instance.setBusy(true);
-                String instanceID = instance.getID();
+                instanceID = instance.getID();
                 instances.put(instanceID, instance);
                 mu.unlock();
 
-                logger.info(String.format("Finish assign, request id: %s, instance %s reused", request.getRequestId(), instanceID));
+                //logger.info(String.format("Finish assign, request id: %s, instance %s reused", request.getRequestId(), instanceID));
 
                 SchedulerProto.Assignment assignment = SchedulerProto.Assignment.newBuilder()
                         .setRequestId(request.getRequestId()).setMetaKey(instance.getMeta().getKey())
@@ -102,6 +109,21 @@ public class SimpleScaler implements Scaler {
                 responseObserver.onNext(SchedulerProto.AssignReply.newBuilder().setStatus(SchedulerProto.Status.Ok).setAssigment(assignment).build());
                 responseObserver.onCompleted();
                 return;
+            } else {
+                // Create new instance
+                SchedulerProto.ResourceConfig resourceConfig = SchedulerProto.ResourceConfig.newBuilder()
+                        .setMemoryInMegabytes(request.getMetaData().getMemoryInMb()).build();
+                SlotResourceConfig slotResourceConfig = new SlotResourceConfig(resourceConfig);
+
+                ListenableFuture<Slot> slotFuture = platformClient.CreateSlot(ctx, request.getRequestId(), slotResourceConfig);
+                Slot slot = slotFuture.get();
+                ListenableFuture<Instance> instanceFuture = platformClient.Init(ctx, request.getRequestId(), UUID.randomUUID().toString(), slot, function);
+                Instance instance = instanceFuture.get();
+                mu.lock();
+                instance.setBusy(true);
+                instanceID = instance.getID();
+                instances.put(instanceID, instance);
+                mu.unlock();
             }
         } catch (Exception e) {
             String errorMessage = String.format("Failed to assign instance, request id: %s due to %s", request.getRequestId(), e.getMessage());
@@ -109,7 +131,7 @@ public class SimpleScaler implements Scaler {
             responseObserver.onError(new RuntimeException(errorMessage, e));
         } finally {
             logger.info(String.format("Finish assign, request id: %s, instance id: %s, cost %dms",
-                    request.getRequestId(), instanceId, Duration.between(start, Instant.now()).toMillis()));
+                    request.getRequestId(), instanceID, Duration.between(start, Instant.now()).toMillis()));
         }
     }
 
