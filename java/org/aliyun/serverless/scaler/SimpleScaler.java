@@ -26,6 +26,11 @@ public class SimpleScaler implements Scaler {
     private final CountDownLatch wg;
     private final Map<String, Instance> instances;
     private final Deque<Instance> idleInstances;
+    //允许同时创建的最大实例数
+    private final int MAX_INSTANCE_COUNT = 50;
+    private RequestCounter requestCounter;
+    // 修改扩容触发百分比（根据需要调整此数值）
+    private static final double SCALING_TRIGGER_PERCENTAGE = 1.2; // 前一秒请求总数的80%
 
     public SimpleScaler(Function function, Config config) {
         try {
@@ -48,8 +53,41 @@ public class SimpleScaler implements Scaler {
         String instanceId = UUID.randomUUID().toString();
         try {
             logger.info("Start assign, request id: " + request.getRequestId());
-            mu.lock();
+            //获取前一秒内的请求数
+            int metricInSystem = requestCounter.calculateRequestsInLastSecond(request.getTimestamp());
+            //每个实例的目标请求数，假定一个请求durationsInMs约为50ms，则一秒内一个实例处理请求的数量为20个
+            int targetPerInstance = 20;
+            //需要的实例数量
+            int desiredInstanceCount = metricInSystem /targetPerInstance;
+            if (idleInstances.isEmpty() || idleInstances.size() < desiredInstanceCount * SCALING_TRIGGER_PERCENTAGE) {
+                int newInstances = (int) Math.min(desiredInstanceCount * SCALING_TRIGGER_PERCENTAGE - idleInstances.size(), MAX_INSTANCE_COUNT - idleInstances.size());
+                for (int i = 0; i < newInstances; i++) {
+                    // Create new instance
+                    SchedulerProto.ResourceConfig resourceConfig = SchedulerProto.ResourceConfig.newBuilder()
+                            .setMemoryInMegabytes(request.getMetaData().getMemoryInMb()).build();
+                    SlotResourceConfig slotResourceConfig = new SlotResourceConfig(resourceConfig);
+
+                    ListenableFuture<Slot> slotFuture = platformClient.CreateSlot(ctx, request.getRequestId(), slotResourceConfig);
+                    Slot slot = slotFuture.get();
+
+                    SchedulerProto.Meta meta = SchedulerProto.Meta.newBuilder()
+                            .setKey(request.getMetaData().getKey())
+                            .setRuntime(request.getMetaData().getRuntime())
+                            .setTimeoutInSecs(request.getMetaData().getTimeoutInSecs())
+                            .build();
+                    Function function = new Function(meta);
+
+                    ListenableFuture<Instance> instanceFuture = platformClient.Init(ctx, request.getRequestId(), instanceId, slot, function);
+                    Instance instance = instanceFuture.get();
+                    mu.lock();
+                    instance.setBusy(false);
+                    idleInstances.addLast(instance);
+                    mu.unlock();
+                }
+            }
+
             if (!idleInstances.isEmpty()) {
+                mu.lock();
                 Instance instance = idleInstances.pollFirst();
                 instance.setBusy(true);
                 String instanceID = instance.getID();
@@ -65,39 +103,6 @@ public class SimpleScaler implements Scaler {
                 responseObserver.onCompleted();
                 return;
             }
-            mu.unlock();
-
-            // Create new instance
-            SchedulerProto.ResourceConfig resourceConfig = SchedulerProto.ResourceConfig.newBuilder()
-                    .setMemoryInMegabytes(request.getMetaData().getMemoryInMb()).build();
-            SlotResourceConfig slotResourceConfig = new SlotResourceConfig(resourceConfig);
-
-            ListenableFuture<Slot> slotFuture = platformClient.CreateSlot(ctx, request.getRequestId(), slotResourceConfig);
-            Slot slot = slotFuture.get();
-
-            SchedulerProto.Meta meta = SchedulerProto.Meta.newBuilder()
-                    .setKey(request.getMetaData().getKey())
-                    .setRuntime(request.getMetaData().getRuntime())
-                    .setTimeoutInSecs(request.getMetaData().getTimeoutInSecs())
-                    .build();
-            Function function = new Function(meta);
-
-            ListenableFuture<Instance> instanceFuture = platformClient.Init(ctx, request.getRequestId(), instanceId, slot, function);
-            Instance instance = instanceFuture.get();
-            String instanceID = instance.getID();
-
-            mu.lock();
-            instance.setBusy(true);
-            instances.put(instanceID, instance);
-            mu.unlock();
-
-            logger.info(String.format("request id: %s, instance %s for app %s is created, init latency: %dms",
-                    request.getRequestId(), instanceID, instance.getMeta().getKey(), instance.getInitDurationInMs()));
-            SchedulerProto.Assignment assignment = SchedulerProto.Assignment.newBuilder()
-                    .setRequestId(request.getRequestId()).setMetaKey(instance.getMeta().getKey())
-                    .setInstanceId(instanceID).build();
-            responseObserver.onNext(SchedulerProto.AssignReply.newBuilder().setStatus(SchedulerProto.Status.Ok).setAssigment(assignment).build());
-            responseObserver.onCompleted();
         } catch (Exception e) {
             String errorMessage = String.format("Failed to assign instance, request id: %s due to %s", request.getRequestId(), e.getMessage());
             logger.info(errorMessage);
